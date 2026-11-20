@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.orm import Session
 
-from app.database import get_session
+from app.database import get_read_session
 from app.errors import bad_request
 from app.fhir_utils import etag
 from app.services import queries
@@ -19,7 +19,7 @@ def _etag_headers(version: int) -> dict[str, str]:
 # --- Patient-scoped listing ------------------------------------------------ #
 
 @router.get("/patients/{patient_id}")
-def get_patient(patient_id: str, response: Response, session: Session = Depends(get_session)):
+def get_patient(patient_id: str, response: Response, session: Session = Depends(get_read_session)):
     view = queries.patient_summary(session, patient_id)
     response.headers.update(_etag_headers(view["version"]))
     return view
@@ -27,7 +27,7 @@ def get_patient(patient_id: str, response: Response, session: Session = Depends(
 
 @router.get("/patients/{patient_id}/observations")
 def get_patient_observations(
-    patient_id: str, session: Session = Depends(get_session)
+    patient_id: str, session: Session = Depends(get_read_session)
 ):
     items = queries.list_observations(session, patient_id)
     return {
@@ -44,7 +44,7 @@ def get_patient_observations(
 
 @router.get("/patients/{patient_id}/diagnostic-reports")
 def get_patient_reports(
-    patient_id: str, session: Session = Depends(get_session)
+    patient_id: str, session: Session = Depends(get_read_session)
 ):
     items = queries.list_reports(session, patient_id)
     enriched = []
@@ -75,7 +75,7 @@ def find_patient(
         ...,
         description="FHIR token identifier, format 'system|value' (system optional).",
     ),
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_read_session),
 ):
     if "|" in identifier:
         system, value = identifier.split("|", 1)
@@ -95,7 +95,7 @@ def find_patient(
 
 @router.get("/observations/{observation_id}")
 def get_observation(
-    observation_id: str, response: Response, session: Session = Depends(get_session)
+    observation_id: str, response: Response, session: Session = Depends(get_read_session)
 ):
     view = queries.read_resource(session, "Observation", observation_id)
     response.headers.update(_etag_headers(view["version"]))
@@ -104,7 +104,7 @@ def get_observation(
 
 @router.get("/diagnostic-reports/{report_id}")
 def get_report(
-    report_id: str, response: Response, session: Session = Depends(get_session)
+    report_id: str, response: Response, session: Session = Depends(get_read_session)
 ):
     view = queries.read_resource(session, "DiagnosticReport", report_id)
     obs_ids = queries.report_observation_ids(session, report_id)
@@ -116,7 +116,7 @@ def get_report(
 
 @router.get("/observations/{observation_id}/_history")
 def observation_history(
-    observation_id: str, session: Session = Depends(get_session)
+    observation_id: str, session: Session = Depends(get_read_session)
 ):
     versions = queries.history(session, "Observation", observation_id)
     return {
@@ -129,7 +129,7 @@ def observation_history(
 
 
 @router.get("/diagnostic-reports/{report_id}/_history")
-def report_history(report_id: str, session: Session = Depends(get_session)):
+def report_history(report_id: str, session: Session = Depends(get_read_session)):
     versions = queries.history(session, "DiagnosticReport", report_id)
     return {
         "resourceType": "Bundle",
@@ -141,7 +141,7 @@ def report_history(report_id: str, session: Session = Depends(get_session)):
 
 
 @router.get("/patients/{patient_id}/_history")
-def patient_history(patient_id: str, session: Session = Depends(get_session)):
+def patient_history(patient_id: str, session: Session = Depends(get_read_session)):
     versions = queries.history(session, "Patient", patient_id)
     return {
         "resourceType": "Bundle",

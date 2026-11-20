@@ -68,3 +68,9 @@ def precondition_failed(diagnostics: str) -> "FhirError":
 
 def unprocessable(diagnostics: str) -> "FhirError":
     return FhirError(422, "unprocessable", diagnostics)
+
+
+def temporarily_unavailable(diagnostics: str) -> "FhirError":
+    return FhirError(
+        status.HTTP_503_SERVICE_UNAVAILABLE, "transient", diagnostics
+    )

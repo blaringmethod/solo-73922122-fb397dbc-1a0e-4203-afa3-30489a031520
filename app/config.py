@@ -16,6 +16,17 @@ class Settings:
     IDEMPOTENCY_STALE_SECONDS: int = int(
         os.getenv("IDEMPOTENCY_STALE_SECONDS", "60")
     )
+    # SQLite (shared file, multiple API instances) serializes writers with a
+    # file lock. Wait this long for the lock before surfacing a transient error.
+    SQLITE_BUSY_TIMEOUT_SECONDS: int = int(
+        os.getenv("SQLITE_BUSY_TIMEOUT_SECONDS", "30")
+    )
+    # How many times a bundle is re-validated and retried when a concurrent
+    # writer invalidated its read snapshot (SQLite BUSY_SNAPSHOT / lock loss).
+    DB_BUSY_RETRIES: int = int(os.getenv("DB_BUSY_RETRIES", "8"))
+    DB_BUSY_BACKOFF_SECONDS: float = float(
+        os.getenv("DB_BUSY_BACKOFF_SECONDS", "0.02")
+    )
 
 
 settings = Settings()

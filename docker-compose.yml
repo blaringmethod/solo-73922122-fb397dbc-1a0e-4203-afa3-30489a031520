@@ -1,29 +1,41 @@
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: research
-      POSTGRES_PASSWORD: research
-      POSTGRES_DB: researchdb
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U research -d researchdb"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-
-  api:
+  # Two API instances share ONE SQLite database file on a named volume, as the
+  # task requires. SQLite has no network server: the file is the database. Both
+  # containers mount the same volume at the same path so they see one file.
+  api-1:
     build: .
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg2://research:research@db:5432/researchdb
+      DATABASE_URL: sqlite:////data/research.db
+      SQLITE_BUSY_TIMEOUT_SECONDS: "30"
+      IDEMPOTENCY_STALE_SECONDS: "60"
+    volumes:
+      - sqlite_data:/data
     ports:
-      - "8000:8000"
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2)\""]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  api-2:
+    build: .
+    environment:
+      DATABASE_URL: sqlite:////data/research.db
+      SQLITE_BUSY_TIMEOUT_SECONDS: "30"
+      IDEMPOTENCY_STALE_SECONDS: "60"
+    volumes:
+      - sqlite_data:/data
+    ports:
+      - "8002:8000"
+    depends_on:
+      api-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2)\""]
+      interval: 3s
+      timeout: 5s
+      retries: 30
 
 volumes:
-  pgdata:
+  sqlite_data:

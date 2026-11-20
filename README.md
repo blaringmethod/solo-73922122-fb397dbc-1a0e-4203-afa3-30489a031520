@@ -1,22 +1,33 @@
 # 实验室 FHIR R4 报告接入研究库（Lab FHIR Research Ingest API）
 
-FastAPI + PostgreSQL 实现的 FHIR R4 事务型 Bundle 接入服务。检验科报告包以
-transaction Bundle 提交，服务在**单数据库事务**内完成条件建患、观测/报告的
-新增或版本化更新，并通过**接入单号幂等账本**保证“同内容重试复用首次回执、
-异内容拒绝、响应丢失/进程重启不重复应用”。
+FastAPI 实现的 FHIR R4 事务型 Bundle 接入服务。检验科报告包以 transaction
+Bundle 提交，服务在**单数据库事务**内完成条件建患、观测/报告的新增或版本化
+更新，并通过**接入单号幂等账本**保证“同内容重试复用首次回执、异内容拒绝、
+响应丢失/进程重启不重复应用”。
 
-## 1. 一键启动（Docker Compose）
+支持两种数据库：PostgreSQL（生产，行锁 MVCC）与 SQLite（单文件，可被**多个
+API 实例共享**）。SQLite 模式下通过显式 `BEGIN IMMEDIATE` 写事务 + WAL 把
+“校验—写入—提交”放进同一个写锁内，保证双实例并发提交的结果等价于依次提交。
+
+## 1. 一键启动（Docker Compose，双实例共享 SQLite）
 
 ```bash
 docker compose up --build
 ```
 
-- API 与交互式文档：<http://localhost:8000/docs>（Swagger UI，可直接在页面上发起 POST /fhir）
-- OpenAPI：<http://localhost:8000/openapi.json>
-- 健康检查：<http://localhost:8000/health>
-- PostgreSQL：`localhost:5432`，库 `researchdb`，用户/密码 `research/research`
+启动 **两个 API 实例**，它们挂载同一个命名卷 `sqlite_data`，共用同一个数据库
+文件 `/data/research.db`：
 
-首次启动时 API 容器会等待数据库就绪并自动建表（`app/db_init.py`）。
+- 实例 1：<http://localhost:8001/docs>
+- 实例 2：<http://localhost:8002/docs>
+- OpenAPI：`/openapi.json`；健康检查：`/health`
+
+两个实例都可从 `/docs` 直接发起 `POST /fhir` 并查询结果；无论请求落在哪个
+实例，读到的都是同一个库。容器启动时执行 `app/db_init.py` 建表（并发建表
+由写锁 + 重试保证安全）。
+
+> 如需 PostgreSQL，把两个服务的 `DATABASE_URL` 改为
+> `postgresql+psycopg2://...` 并去掉共享卷即可；业务语义完全一致。
 
 ## 2. 提交报告包
 
@@ -131,28 +142,43 @@ Content-Type: application/json
    无法解析、引用不存在的外部资源 → `422`，整包拒绝。
 4. **患者一致性**：每份报告与其全部观测必须同属一个患者；把观测改挂其他
    患者时，若已有引用报告未在**同一 Bundle** 内一并更正 → `422`。
-5. **原子性**：任何校验/版本/引用失败都会回滚整个事务，不留任何资源或
-   修改；其他患者已提交的数据不受影响，后续合法 Bundle 仍可正常提交。
-6. **幂等**：
+5. **原子性**：任何校验/版本/引用失败都会回滚整个事务，不留任何资源、患者
+   标识、报告-观测关联或版本记录；其他患者已提交的数据不受影响，后续合法
+   Bundle 仍可正常提交。原子性在 SQLite 下同样成立：事务以显式 `BEGIN` 开启
+   （驱动 `isolation_level=None`），`SAVEPOINT` 不会把外层事务提前提交。
+6. **双实例并发（共享 SQLite）**：每个写请求先取 `BEGIN IMMEDIATE` 写锁，
+   “归属校验 → 写入 → 提交”全程持有该锁，因此双实例的提交等价于依次提交，
+   不会出现校验通过后另一实例改坏归属却仍落库（写偏斜）。竞争失败的一方返回
+   `422`（业务校验未通过）或 `503`（写锁短暂竞争，可用同一单号重试），绝不
+   静默合并。仅更新既有资源的包同样在写锁内校验，另一实例无法在“校验后、
+   写入前”插入无关患者的检验包。
+7. **幂等**：
    - 同 `Idempotency-Key` + 同内容（规范化 JSON 哈希，与键序/空白无关）→
      直接返回首次回执，不重复落库；
-   - 同 key + 异内容 → `409`；
+   - 同 key + 异内容 → `409`（已完成记录及其回执保持不变）；
    - 失败的提交会释放幂等槽，修正后可用同一单号重试；
-   - 幂等状态持久化在 PostgreSQL，进程重启/响应丢失后重试仍然安全。
-7. 所有错误均返回 FHIR `OperationOutcome`（`application/fhir+json`）。
+   - 幂等状态持久化在数据库，进程重启/响应丢失/跨实例重试仍然安全。
+8. 所有错误均返回 FHIR `OperationOutcome`（`application/fhir+json`）。
 
 ## 5. 本地开发与自测（无需 Docker）
 
 ```bash
 pip install -r requirements.txt
-export DATABASE_URL="postgresql+psycopg2://research:research@localhost:5432/researchdb"
+
+# SQLite（含双实例共享文件场景）
+export DATABASE_URL="sqlite:////tmp/research.db"
 python -m app.db_init
 uvicorn app.main:app --reload
 pytest -q
+
+# PostgreSQL（并发/行锁语义）
+export DATABASE_URL="postgresql+psycopg2://research:research@localhost:5432/researchdb"
 ```
 
 测试默认连接 `postgresql+psycopg2://research@localhost:5433/researchdb_test?host=/tmp`，
-可用 `DATABASE_URL` 覆盖；并发测试（同标识建患、If-Match 竞争）仅在 PostgreSQL 下执行。
+可用 `DATABASE_URL` 覆盖。`tests/test_sqlite_two_instances.py` 用两个独立
+engine/会话工厂模拟两个实例共享同一 SQLite 文件，覆盖归属校验竞争、写锁串行化、
+拒收回滚与单号复用。
 
 ## 6. 目录结构
 
@@ -160,15 +186,16 @@ pytest -q
 app/
   main.py            FastAPI 入口、异常处理
   config.py          环境配置
-  database.py        引擎/会话/建表
+  database.py        引擎/会话/建表（PG 行锁；SQLite 显式 BEGIN IMMEDIATE + WAL）
   models.py          ORM（患者/标识/观测/报告/关联/版本/幂等账本，PG JSONB）
   errors.py          OperationOutcome 错误体系
   fhir_utils.py      ETag/版本工具
-  routers/           /fhir 提交与资源读取路由
+  routers/           /fhir 提交（写会话）与资源读取（读会话）路由
   services/
     bundle.py        Bundle 校验、幂等、事务处理、患者一致性规则
     queries.py       读取与历史查询
-scripts/entrypoint.sh  容器启动（等库+建表）
-tests/               25 个 pytest 用例（含并发、重启、原子性）
-docker-compose.yml   db + api 两服务，含健康检查
+scripts/entrypoint.sh  容器启动（建表，支持并发）
+scripts/smoke.sh       端到端冒烟（可用 SECOND_BASE_URL 验证双实例）
+tests/                 pytest 用例（含双实例 SQLite 并发、重启、原子性）
+docker-compose.yml     api-1 + api-2 两实例共享 SQLite 卷，含健康检查
 ```

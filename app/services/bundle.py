@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -27,12 +28,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.database import is_busy_error, is_sqlite
 from app.errors import (
     FhirError,
     bad_request,
     conflict,
     not_found,
     precondition_failed,
+    temporarily_unavailable,
     unprocessable,
 )
 from app.fhir_utils import etag, parse_etag
@@ -75,11 +78,27 @@ class ParsedEntry:
 
 
 def _is_sqlite(session: Session) -> bool:
-    return session.bind.dialect.name == "sqlite"  # type: ignore[union-attr]
+    return is_sqlite(session)
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """Transient condition where no work was committed and a retry is safe.
+
+    SQLite raises 'database is locked' when an upfront write lock could not be
+    obtained (another instance holds it) and 'database is locked'/
+    'busy_snapshot' when a read snapshot could not be upgraded. IntegrityError
+    from a *concurrent* patient insert is handled separately via SAVEPOINT.
+    """
+    return is_busy_error(exc)
 
 
 def _locked(session: Session, model: object, row_id: str):
-    """session.get with row locking where the dialect supports it."""
+    """session.get with row locking where the dialect supports it.
+
+    SQLite has no row locks; writers are serialized by the whole-file
+    ``BEGIN IMMEDIATE`` transaction opened for every bundle (see
+    app/database.py), which is equivalent to locking every row we read.
+    """
     if _is_sqlite(session):
         return session.get(model, row_id)
     return session.get(model, row_id, with_for_update=True)
@@ -364,48 +383,103 @@ def store_completed_response(session: Session, key: str, response: dict) -> None
 # Transactional processing
 # --------------------------------------------------------------------------- #
 
+def _release_slot(session: Session, key: str) -> None:
+    """Drop the pending idempotency marker so the accession may be reused.
+
+    Retries briefly if another instance currently holds the SQLite write lock,
+    because losing the marker is what lets a corrected bundle reuse the same
+    accession number.
+    """
+    session.rollback()
+    for attempt in range(1, settings.DB_BUSY_RETRIES + 1):
+        try:
+            session.query(IdempotencyRecord).filter_by(key=key).delete()
+            session.commit()
+            return
+        except Exception as exc:
+            session.rollback()
+            if not is_busy_error(exc) or attempt == settings.DB_BUSY_RETRIES:
+                return  # defensive: never mask the original bundle error
+            time.sleep(settings.DB_BUSY_BACKOFF_SECONDS * attempt)
+
+
 def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict:
-    entries = validate_bundle(bundle)
+    # Structural validation is pure and cheap; re-run per attempt so every
+    # attempt starts from fresh ParsedEntry objects (no stale row ids/versions
+    # after a rolled-back attempt).
+    validate_bundle(bundle)
     hash_value = content_hash(bundle)
 
-    replay = acquire_idempotency_slot(session, idempotency_key, hash_value)
-    if replay is not None:
-        return _canonicalize(replay)
-
-    try:
-        patient_entries = [e for e in entries if e.resource_type == "Patient"]
-        observation_entries = [e for e in entries if e.resource_type == "Observation"]
-        report_entries = [e for e in entries if e.resource_type == "DiagnosticReport"]
-
-        patient_rows = _resolve_patients(session, patient_entries)
-        _resolve_subjects(session, entries, patient_rows)
-        obs_rows = _resolve_observations(session, observation_entries, patient_rows, entries)
-        report_rows = _resolve_reports(session, report_entries, entries, obs_rows)
-
-        _validate_patient_alignment(entries, obs_rows, report_rows, session)
-
-        _apply_observations(session, observation_entries, obs_rows, patient_rows, entries)
-        _apply_reports(session, report_entries, report_rows, obs_rows, entries)
-
-        receipt = _build_receipt(entries, idempotency_key)
-        store_completed_response(session, idempotency_key, receipt)
-        session.commit()
-        return _canonicalize(receipt)
-    except FhirError:
-        # Roll back all resource writes and release the idempotency slot so the
-        # caller may correct the payload and retry with the same accession key.
-        session.rollback()
-        session.query(IdempotencyRecord).filter_by(key=idempotency_key).delete()
-        session.commit()
-        raise
-    except Exception:
-        session.rollback()
+    slot_acquired = False
+    attempt = 0
+    while True:
         try:
-            session.query(IdempotencyRecord).filter_by(key=idempotency_key).delete()
-            session.commit()
-        except Exception:  # pragma: no cover - defensive
+            if not slot_acquired:
+                replay = acquire_idempotency_slot(session, idempotency_key, hash_value)
+                if replay is not None:
+                    return _canonicalize(replay)
+                slot_acquired = True
+
+            entries = validate_bundle(bundle)
+            receipt = _apply_bundle(session, entries, idempotency_key)
+            return receipt
+        except FhirError:
+            # Roll back all resource writes and release the idempotency slot so
+            # the caller may correct the payload and retry with the same
+            # accession key. Never touch a slot we did not create: a 409 for
+            # "same key, different content" comes from acquire_idempotency_slot
+            # and must leave the completed record (and its receipt) intact.
+            if slot_acquired:
+                _release_slot(session, idempotency_key)
+            else:
+                session.rollback()
+            raise
+        except Exception as exc:
             session.rollback()
-        raise
+            if is_retryable_error(exc) and attempt < settings.DB_BUSY_RETRIES:
+                attempt += 1
+                time.sleep(settings.DB_BUSY_BACKOFF_SECONDS * attempt)
+                continue
+            if slot_acquired:
+                _release_slot(session, idempotency_key)
+            if is_retryable_error(exc):
+                raise temporarily_unavailable(
+                    "Database is busy with a concurrent submission; retry the "
+                    "bundle with the same Idempotency-Key."
+                ) from exc
+            raise
+
+
+def _apply_bundle(
+    session: Session, entries: list[ParsedEntry], idempotency_key: str
+) -> dict:
+    """Validate against current state, write, and commit one bundle atomically.
+
+    On SQLite the first statement opens a ``BEGIN IMMEDIATE`` transaction, so
+    all reads used for validation happen under the same exclusive write lock
+    as the writes: no other instance can interleave between our ownership
+    check and our commit, making the outcome identical to a sequential
+    submission. On PostgreSQL row-level ``FOR UPDATE`` locks provide the same
+    guarantee for the rows involved.
+    """
+    patient_entries = [e for e in entries if e.resource_type == "Patient"]
+    observation_entries = [e for e in entries if e.resource_type == "Observation"]
+    report_entries = [e for e in entries if e.resource_type == "DiagnosticReport"]
+
+    patient_rows = _resolve_patients(session, patient_entries)
+    _resolve_subjects(session, entries, patient_rows)
+    obs_rows = _resolve_observations(session, observation_entries, patient_rows, entries)
+    report_rows = _resolve_reports(session, report_entries, entries, obs_rows)
+
+    _validate_patient_alignment(entries, obs_rows, report_rows, session)
+
+    _apply_observations(session, observation_entries, obs_rows, patient_rows, entries)
+    _apply_reports(session, report_entries, report_rows, obs_rows, entries)
+
+    receipt = _build_receipt(entries, idempotency_key)
+    store_completed_response(session, idempotency_key, receipt)
+    session.commit()
+    return _canonicalize(receipt)
 
 
 # --------------------------------------------------------------------------- #
